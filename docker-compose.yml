@@ -16,6 +16,7 @@ services:
     build: .
     volumes:
       - ./app:/app/app
+      - ./tests:/app/tests
     environment: &env
       DATABASE_URL: postgresql+asyncpg://crm:crm@postgres:5432/crm
       REDIS_URL: redis://redis:6379/0
