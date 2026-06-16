@@ -15,6 +15,7 @@ class Settings(BaseSettings):
     jobs_per_user_running_limit: int = 3
     jobs_cache_ttl_seconds: int = 30
     rate_limit_per_minute: int = 10
+    admin_setup_token: str | None = None
 
 @lru_cache
 def get_settings() -> Settings:
