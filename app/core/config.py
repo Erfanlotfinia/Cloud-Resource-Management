@@ -15,6 +15,13 @@ class Settings(BaseSettings):
     jobs_per_user_running_limit: int = 3
     jobs_cache_ttl_seconds: int = 30
     rate_limit_per_minute: int = 10
+    job_lease_seconds: int = 60
+    job_retry_base_delay_seconds: int = 5
+    outbox_poll_interval_seconds: float = 2.0
+    outbox_max_retries: int = 12
+    jobs_dead_letter_exchange: str = 'jobs.dlx'
+    jobs_dead_letter_queue: str = 'jobs.dead'
+    jobs_dead_letter_routing_key: str = 'jobs.dead'
     admin_setup_token: str | None = None
 
 @lru_cache

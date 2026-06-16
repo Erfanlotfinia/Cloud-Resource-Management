@@ -1,120 +1,59 @@
 # Design Notes
 
-## 1. Scaling: 100x request growth
+## Production reliability model
 
-### Bottlenecks
+The API uses PostgreSQL as the source of truth, Redis as an optional acceleration layer, RabbitMQ as an at-least-once work signal, and workers as horizontally scalable executors. All correctness decisions are made in PostgreSQL transactions so broker, cache, and worker failures cannot corrupt job state.
 
-- PostgreSQL write volume for users, jobs, and logs.
-- Hot per-user concurrency checks and idempotency lookups.
-- Redis connection pressure for cache, rate limiting, and pub/sub.
-- RabbitMQ queue depth and broker I/O.
-- Worker throughput for long-running jobs.
+## Transactional outbox for RabbitMQ consistency
 
-### API scaling
+`POST /jobs` no longer publishes directly to RabbitMQ. Job creation and an `outbox_events` insert are committed in the same PostgreSQL transaction. A separate outbox publisher process reads pending events with `FOR UPDATE SKIP LOCKED`, publishes durable RabbitMQ messages, and marks events `sent`. If RabbitMQ is down, the outbox row remains pending and is retried with exponential backoff. This removes the crash window where a job is committed but never published.
 
-The API is stateless except for external dependencies, so it can run behind a load balancer with many replicas. Keep JWT validation local, tune DB/Redis/RabbitMQ pools, and preserve thin route handlers.
+Publishing is idempotent: RabbitMQ messages include the job id, correlation id, and outbox event id/message id, while the worker still must claim the job in PostgreSQL before execution. Duplicate broker deliveries are safe because the database lease transition is the only authority.
 
-### Worker scaling
+## Worker leasing and duplicate execution prevention
 
-Workers can be scaled horizontally. Each worker claims jobs with database row locks and state checks, so duplicate messages do not produce duplicate execution. Tune RabbitMQ prefetch to match job duration and downstream capacity.
+Workers never execute just because a RabbitMQ message arrived. They atomically claim a queued job with a PostgreSQL row lock and the condition `status = queued AND (locked_by IS NULL OR lock_expires_at < now())`. Claiming sets `status = running`, `locked_by = worker_id`, and `lock_expires_at = now + lease_timeout` in the same critical section.
 
-### PostgreSQL scaling
+During execution, workers renew the lease. Completion and failure updates require the same `locked_by` value, so a stale worker cannot overwrite a job reclaimed by another worker. RabbitMQ is acknowledged only after the processing callback returns and after the database state transition has committed.
 
-Use stronger instances, connection pooling, read replicas for list/admin reads, partitioning for very large job tables, and careful indexes on owner/status/created_at/idempotency paths.
+## Atomic max-3 running jobs per user
 
-### Redis scaling
+The per-user running limit is enforced inside PostgreSQL transactions, not in application memory. Workers lock the owner row with `SELECT ... FOR UPDATE`, count current running jobs for that owner, and only then transition one job from queued to running. This serializes concurrent claims for the same user and prevents two workers from simultaneously observing capacity and exceeding the limit.
 
-Use Redis Sentinel or Cluster, bounded TTLs, and separate logical databases or key prefixes for cache/rate-limit/pub-sub. Monitor evictions and latency.
+Pending jobs are promoted to queued only after capacity becomes available. Promotion writes a new outbox event instead of publishing directly.
 
-### RabbitMQ scaling
+## Crash recovery
 
-Use durable queues, persistent messages, quorum queues for higher availability, broker clustering, queue-length alerts, and dead-letter queues for poison messages.
+A recovery loop scans for `running` jobs with expired leases. It increments `retry_count`, clears lease fields, and either requeues the job through the outbox or marks it failed once retries are exhausted. This prevents jobs from remaining stuck forever after a worker process, host, or network failure.
 
-## 2. RabbitMQ failure
+Execution failures are separated into retryable and non-retryable paths. Retryable failures schedule a delayed outbox event using exponential backoff; non-retryable failures go directly to `failed`. Retry counts are bounded by `max_retries`, so jobs eventually reach a terminal state.
 
-### What happens now?
+## Redis degradation modes
 
-`POST /jobs` writes the job to PostgreSQL, then publishes to RabbitMQ. If publish fails, the job is moved back to `pending`, an error log is recorded, caches are invalidated, and the API returns `503`.
+Redis is not required for correctness:
 
-### Risks
+- Rate limiting: if Redis is unavailable, the request is allowed and a structured warning `rate_limit_bypassed_due_to_redis_failure` is logged.
+- Cache: reads fall back to PostgreSQL and cache writes/invalidations are skipped with warnings.
+- SSE: Redis pub/sub failures degrade to polling snapshots over the existing SSE connection, so clients still observe progress without real-time push.
 
-The DB write and broker publish are not atomic. A crash between commit and publish can strand a job. A publish success followed by API failure can also confuse clients unless they use idempotency keys.
+## Exactly-once vs at-least-once tradeoff
 
-### Recommended improvements
+The system provides at-least-once message delivery and effectively-once job state transitions. RabbitMQ can redeliver, the outbox publisher can retry, and workers can crash after side effects. PostgreSQL leases prevent two active workers from owning the same job concurrently, but external side effects performed by job code must still be idempotent or guarded by their own idempotency keys for true end-to-end exactly-once behavior.
 
-Add a transactional outbox table. Job creation and outbox insertion should happen in one database transaction; a relay publishes outbox rows to RabbitMQ and marks them delivered. Add retry/backoff, dead-lettering, and operational dashboards.
+## Dead-letter handling
 
-## 3. Worker failure
+RabbitMQ topology declares a durable dead-letter exchange and queue (`jobs.dlx` / `jobs.dead`). The primary jobs queue is configured with dead-letter routing so poison broker messages have a defined destination after broker-side rejection policies or future queue retry policies are enabled. Application retries are primarily represented in PostgreSQL/outbox state for auditability.
 
-### Current behavior
+## Scaling considerations
 
-Messages are acknowledged only after the processing callback returns. The worker marks a queued job as `running`, executes it, then marks it `completed`, `failed`, or `queued` for retry.
+- API replicas remain stateless and can scale behind a load balancer.
+- Workers scale horizontally because row locks and leases coordinate execution.
+- PostgreSQL needs indexes on owner/status/created_at/idempotency/lease paths and may later need partitioning for very large job tables.
+- Redis should be run with HA for performance, but its outage only degrades optional behavior.
+- RabbitMQ should use durable queues, persistent messages, publisher confirms in stricter deployments, quorum queues, and queue-depth/DLQ alerts.
 
-### Risks
+## Remaining trade-offs
 
-If a worker crashes after marking a job `running`, RabbitMQ can redeliver the message, but the next worker will skip the job because it is already `running`. That prevents duplicates but can leave stale running jobs.
-
-### Improvements
-
-Add leases and heartbeats (`locked_by`, `lock_expires_at`, `heartbeat_at`). A recovery process should detect stale running jobs, increment retry count when appropriate, and requeue them. Long-running tasks should periodically check cancellation and lease validity.
-
-## 4. Duplicate processing
-
-Multiple workers may receive duplicate messages, but processing is guarded by the database:
-
-- The worker selects the job with `FOR UPDATE`.
-- Only `queued` jobs are claimable.
-- The worker locks the owner row before checking running-job capacity.
-- If capacity exists, the job transitions to `running` in the same critical section.
-- Terminal states are idempotent; completed/failed/cancelled/running jobs are skipped.
-
-This prevents two workers from successfully claiming the same queued job. External side effects should still be idempotent in production.
-
-## 5. Redis failure
-
-### Affected features
-
-- `GET /jobs` response caching.
-- `POST /jobs` rate limiting.
-- Cache invalidation.
-- SSE real-time status delivery through pub/sub.
-
-### Degraded behavior
-
-The API falls back to PostgreSQL for normal reads/writes where possible. Rate limiting is skipped when Redis is down to preserve availability, and warnings are logged. SSE cannot reliably deliver events without pub/sub.
-
-### Recommended improvements
-
-Use Redis HA, circuit breakers, metrics, local emergency rate limits, and optional durable event storage for replayable status streams.
-
-## 6. Large-scale database: 100M+ jobs
-
-### Indexing strategy
-
-Keep unique `users.email`, `jobs.owner_id`, `jobs.status`, `jobs.created_at`, `(jobs.owner_id, jobs.created_at)`, partial unique `(owner_id, idempotency_key) WHERE idempotency_key IS NOT NULL`, and `job_logs.job_id`. Consider `(owner_id, created_at DESC, id DESC)` and `(status, created_at)` indexes for common paths.
-
-### Partitioning
-
-Partition jobs and logs by month/quarter or by hash of `owner_id` depending on access patterns. Time partitioning simplifies archival; hash partitioning spreads tenant hot spots.
-
-### Archiving
-
-Move old terminal jobs and logs to cold storage after retention windows. Keep summaries in hot tables if users need historical lists.
-
-### Query optimization
-
-Use cursor pagination on `(created_at DESC, id DESC)` instead of offsets. Avoid unbounded admin scans, select only response fields when needed, and cache stable pages briefly.
-
-### Read replicas
-
-Serve admin/reporting/list views from replicas when read-after-write consistency is not required. Keep writes and state transitions on the primary.
-
-### Cursor pagination impact
-
-Cursor pagination remains efficient at high cardinality because it uses indexed tuple comparisons and does not scan skipped rows like offset pagination.
-
-## Current trade-offs
-
-- Running cancellation is practical but cooperative: the API marks running jobs as `cancelled`, while real task code should periodically check cancellation before doing irreversible work.
-- RabbitMQ publish is not transactionally atomic with PostgreSQL yet; the documented production answer is a transactional outbox.
-- Stale running job recovery is documented as the next production hardening step.
+- Running cancellation is cooperative; job implementations must check for cancellation before irreversible work.
+- The system is at-least-once at the broker boundary; external side effects still need idempotency.
+- Outbox rows marked `failed` require operational alerting/replay tooling.

@@ -21,14 +21,21 @@ async def cancel(job_id:int,user:User=Depends(current_user),session:AsyncSession
 async def logs(job_id:int,user:User=Depends(current_user),session:AsyncSession=Depends(get_session)): return await svc.logs(job_id,user,session)
 @router.get('/{job_id}/events')
 async def events(job_id:int, request:Request, user:User=Depends(current_user), session:AsyncSession=Depends(get_session)):
-    await svc.get_job(job_id,user,session)
+    job = await svc.get_job(job_id,user,session)
     async def gen():
-        pubsub=get_redis().pubsub(); await pubsub.subscribe(f'job:{job_id}:events')
+        pubsub = None
         try:
+            pubsub=get_redis().pubsub(); await pubsub.subscribe(f'job:{job_id}:events')
+            yield f"event: snapshot\ndata: {json.dumps({'job_id': job.id, 'user_id': job.owner_id, 'status': job.status.value, 'event_type': 'job_snapshot', 'correlation_id': job.correlation_id})}\n\n"
             while not await request.is_disconnected():
-                msg=await pubsub.get_message(ignore_subscribe_messages=True, timeout=10)
+                msg=await pubsub.get_message(ignore_subscribe_messages=True, timeout=1.0)
                 if msg: yield f"data: {msg['data']}\n\n"
                 else: yield ': heartbeat\n\n'
-                await asyncio.sleep(0.1)
-        finally: await pubsub.unsubscribe(f'job:{job_id}:events'); await pubsub.close()
+        except Exception:
+            while not await request.is_disconnected():
+                fresh = await svc.get_job(job_id, user, session)
+                yield f"event: poll\ndata: {json.dumps({'job_id': fresh.id, 'user_id': fresh.owner_id, 'status': fresh.status.value, 'event_type': 'job_status_poll', 'correlation_id': fresh.correlation_id})}\n\n"
+                await asyncio.sleep(5)
+        finally:
+            if pubsub: await pubsub.unsubscribe(f'job:{job_id}:events'); await pubsub.close()
     return StreamingResponse(gen(), media_type='text/event-stream')

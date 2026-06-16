@@ -159,7 +159,7 @@ Full-system smoke test:
 1. `docker compose up --build`
 2. Register and login a user.
 3. Create a job with `duration_seconds: 5`.
-4. Watch `docker compose logs -f worker`.
+4. Watch `docker compose logs -f outbox-publisher worker`.
 5. Poll `GET /jobs/{id}` until `completed`.
 6. Check `GET /jobs/{id}/logs`.
 7. Repeat `POST /jobs` with `Idempotency-Key: abc123`.
@@ -170,7 +170,8 @@ Full-system smoke test:
 
 ## Troubleshooting
 
-- If RabbitMQ is unavailable, job creation may persist a job but returns `503` when dispatch fails; the design notes recommend a transactional outbox for production hardening.
+- Job creation writes queued dispatches to the PostgreSQL transactional outbox; ensure the `outbox-publisher` service is running so pending outbox events are published to RabbitMQ.
+- If RabbitMQ is unavailable, job creation can still persist queued jobs and outbox events; the publisher retries with backoff until the broker returns or retry limits are reached.
 - If Redis is unavailable, PostgreSQL-backed APIs continue; caching, rate limiting, and SSE delivery degrade and warnings are logged.
-- If a worker crashes during a job, RabbitMQ may redeliver but a job already marked `running` needs stale-running recovery in production.
-- For local Docker startup issues, inspect `docker compose logs api worker postgres redis rabbitmq` and verify health checks.
+- If a worker crashes during a job, the worker recovery loop detects expired leases, requeues retryable jobs through the outbox, and marks exhausted jobs failed.
+- For local Docker startup issues, inspect `docker compose logs api outbox-publisher worker postgres redis rabbitmq` and verify health checks.
