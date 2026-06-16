@@ -15,10 +15,11 @@ async def execute(payload:dict)->dict:
     return {'ok': True, 'task_type': payload.get('task_type','demo')}
 async def trigger_next(owner_id:int):
     async with SessionLocal() as s:
-        running=await s.scalar(select(__import__('sqlalchemy').func.count()).select_from(Job).where(Job.owner_id==owner_id, Job.status==JobStatus.running))
-        if running>=get_settings().jobs_per_user_running_limit: return
-        job=await s.scalar(select(Job).where(Job.owner_id==owner_id, Job.status==JobStatus.queued).order_by(Job.created_at).with_for_update(skip_locked=True).limit(1))
-        if job: await publish_job(job.id); s.add(JobLog(job_id=job.id, message='queued job published')); await s.commit()
+        reserved=await s.scalar(select(__import__('sqlalchemy').func.count()).select_from(Job).where(Job.owner_id==owner_id, Job.status.in_([JobStatus.queued, JobStatus.running])))
+        if reserved>=get_settings().jobs_per_user_running_limit: return
+        job=await s.scalar(select(Job).where(Job.owner_id==owner_id, Job.status==JobStatus.pending).order_by(Job.created_at).with_for_update(skip_locked=True).limit(1))
+        if job:
+            job.status=JobStatus.queued; await publish_job(job.id); s.add(JobLog(job_id=job.id, message='queued job published')); await s.commit(); await publish_status(job.id,'queued')
 async def process(job_id:int):
     async with SessionLocal() as s:
         job=await s.scalar(select(Job).where(Job.id==job_id).with_for_update())

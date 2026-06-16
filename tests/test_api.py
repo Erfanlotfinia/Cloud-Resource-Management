@@ -14,7 +14,10 @@ async def client(monkeypatch):
     async def override_session():
         async with Session() as s:
             yield s
-    async def fake_publish(job_id:int): return None
+    published=[]
+    async def fake_publish(job_id:int):
+        published.append(job_id)
+        return None
     async def noop(*a, **k): return None
     async def none(*a, **k): return None
     app.dependency_overrides[get_session] = override_session
@@ -29,6 +32,7 @@ async def client(monkeypatch):
         async def incr(self,k): self.n += 1; return self.n
         async def expire(self,k,t): return None
     monkeypatch.setattr(redisinfra, 'get_redis', lambda: R())
+    app.state.published_jobs = published
     async with AsyncClient(transport=ASGITransport(app=app), base_url='http://test') as ac:
         yield ac
     app.dependency_overrides.clear()
@@ -52,8 +56,23 @@ async def test_register_login_create_idempotent_cancel_logs_and_pagination(clien
     assert (await client.get(f'/jobs/{job_id}/logs', headers=h)).status_code==200
 
 @pytest.mark.asyncio
-async def test_user_forbidden_admin_allowed(client):
-    t1=await token(client,'a@example.com'); t2=await token(client,'b@example.com'); admin=await token(client,'admin@example.com','admin')
+async def test_user_forbidden_and_public_admin_registration_ignored(client):
+    t1=await token(client,'a@example.com'); t2=await token(client,'b@example.com')
+    admin_response=await client.post('/auth/register', json={'email':'admin@example.com','password':'password123','role':'admin'})
+    assert admin_response.status_code==201
+    assert admin_response.json()['role']=='user'
     r=await client.post('/jobs', headers={'Authorization':f'Bearer {t1}'}, json={'payload':{}}); jid=r.json()['id']
     assert (await client.get(f'/jobs/{jid}', headers={'Authorization':f'Bearer {t2}'})).status_code==403
-    assert (await client.get(f'/jobs/{jid}', headers={'Authorization':f'Bearer {admin}'})).status_code==200
+
+@pytest.mark.asyncio
+async def test_create_job_reserves_dispatch_slots(client):
+    t=await token(client,'slots@example.com')
+    h={'Authorization':f'Bearer {t}'}
+    statuses=[]
+    for _ in range(4):
+        r=await client.post('/jobs', headers=h, json={'payload':{}})
+        assert r.status_code==201
+        statuses.append(r.json()['status'])
+    assert statuses.count('queued')==3
+    assert statuses.count('pending')==1
+    assert len(app.state.published_jobs)==3

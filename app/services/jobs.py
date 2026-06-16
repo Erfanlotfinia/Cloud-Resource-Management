@@ -31,13 +31,15 @@ async def create_job(data, user:User, session:AsyncSession, idem:str|None):
     if idem:
         existing=await session.scalar(select(Job).where(Job.owner_id==user.id, Job.idempotency_key==idem))
         if existing: return existing
-    running=await session.scalar(select(func.count()).select_from(Job).where(Job.owner_id==user.id, Job.status==JobStatus.running))
-    job=Job(owner_id=user.id,status=JobStatus.queued,payload=data.payload,max_retries=data.max_retries,idempotency_key=idem)
+    await session.scalar(select(User.id).where(User.id==user.id).with_for_update())
+    reserved=await session.scalar(select(func.count()).select_from(Job).where(Job.owner_id==user.id, Job.status.in_([JobStatus.queued, JobStatus.running])))
+    should_publish = reserved < get_settings().jobs_per_user_running_limit
+    job=Job(owner_id=user.id,status=JobStatus.queued if should_publish else JobStatus.pending,payload=data.payload,max_retries=data.max_retries,idempotency_key=idem)
     session.add(job); await session.flush(); session.add(JobLog(job_id=job.id, level=LogLevel.info, message='job created'))
     await session.commit(); await session.refresh(job); await redisinfra.invalidate_pattern(f'jobs:{user.role}:{user.id}:*')
-    if running < get_settings().jobs_per_user_running_limit:
+    if should_publish:
         try: await publish_job(job.id); session.add(JobLog(job_id=job.id, message='job published')); await session.commit(); await redisinfra.publish_status(job.id, job.status.value)
-        except Exception as e: session.add(JobLog(job_id=job.id, level=LogLevel.error, message=f'RabbitMQ publish failed: {e}')); await session.commit(); raise AppError('rabbitmq_unavailable','Job saved but could not be queued for execution',503)
+        except Exception as e: job.status=JobStatus.pending; session.add(JobLog(job_id=job.id, level=LogLevel.error, message=f'RabbitMQ publish failed: {e}')); await session.commit(); raise AppError('rabbitmq_unavailable','Job saved but could not be queued for execution',503)
     return job
 async def list_jobs(user:User, session:AsyncSession, cursor:str|None, limit:int):
     limit=min(max(limit,1),100); key=f'jobs:{user.role}:{user.id}:{cursor or "first"}:{limit}'; cached=await redisinfra.safe_get(key)

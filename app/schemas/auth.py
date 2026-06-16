@@ -4,7 +4,6 @@ from app.models.user import UserRole
 class RegisterRequest(BaseModel):
     email: EmailStr
     password: str = Field(min_length=8)
-    role: UserRole = UserRole.user
 
 class LoginRequest(BaseModel):
     email: EmailStr
