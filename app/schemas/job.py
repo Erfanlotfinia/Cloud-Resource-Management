@@ -16,6 +16,9 @@ class JobResponse(BaseModel):
     retry_count: int
     max_retries: int
     idempotency_key: str | None = None
+    correlation_id: str
+    locked_by: str | None = None
+    lock_expires_at: datetime | None = None
     started_at: datetime | None = None
     completed_at: datetime | None = None
     cancelled_at: datetime | None = None
