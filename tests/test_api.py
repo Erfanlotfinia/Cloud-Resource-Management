@@ -1,14 +1,11 @@
 import pytest
 from httpx import ASGITransport, AsyncClient
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.core.config import get_settings
 from app.infrastructure import rabbitmq, redis as redisinfra
 from app.infrastructure.database import Base, get_session
 from app.main import app
-from app.models.job import Job, JobStatus
-from app.models.user import User
 from app.workers import runner
 
 
@@ -147,3 +144,26 @@ async def test_worker_success_and_retry_failure_paths(client):
     details = (await client.get(f"/jobs/{fail_id}", headers=headers)).json()
     assert details["status"] == "failed"
     assert details["retry_count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_trigger_next_restores_pending_when_promotion_publish_fails(client, monkeypatch):
+    user_token = await token(client, "promotion-failure@example.com")
+    headers = {"Authorization": f"Bearer {user_token}"}
+    created = []
+    for _ in range(4):
+        response = await client.post("/jobs", headers=headers, json={"payload": {}})
+        assert response.status_code == 201
+        created.append(response.json())
+    pending_job = next(job for job in created if job["status"] == "pending")
+
+    async def failing_publish(job_id: int):
+        raise RuntimeError("broker down")
+
+    monkeypatch.setattr("app.workers.runner.publish_job", failing_publish)
+    await runner.trigger_next(pending_job["owner_id"])
+
+    details = (await client.get(f"/jobs/{pending_job['id']}", headers=headers)).json()
+    assert details["status"] == "pending"
+    logs = (await client.get(f"/jobs/{pending_job['id']}/logs", headers=headers)).json()
+    assert any("RabbitMQ publish failed after pending job promotion" in log["message"] for log in logs)

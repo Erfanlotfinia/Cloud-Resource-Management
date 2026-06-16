@@ -22,7 +22,33 @@ async def execute(payload: dict) -> dict:
     return {"ok": True, "task_type": payload.get("task_type", "demo")}
 
 
+async def mark_queued_and_publish(job_id: int, *, failure_message: str) -> bool:
+    """Publish a queued job and restore it to pending if RabbitMQ publish fails."""
+    try:
+        await publish_job(job_id)
+        await publish_status(job_id, "queued")
+        return True
+    except Exception as exc:
+        log.warning("job_publish_failed", job_id=job_id, error=str(exc))
+        async with SessionLocal() as session:
+            job = await session.scalar(select(Job).where(Job.id == job_id).with_for_update())
+            if job is not None and job.status == JobStatus.queued:
+                job.status = JobStatus.pending
+                session.add(
+                    JobLog(
+                        job_id=job.id,
+                        level=LogLevel.error,
+                        message=f"{failure_message}: {exc}",
+                    )
+                )
+                await session.commit()
+                await invalidate_pattern("jobs:*")
+                await publish_status(job.id, "pending")
+        return False
+
+
 async def trigger_next(owner_id: int) -> None:
+    promoted_job_id: int | None = None
     async with SessionLocal() as session:
         await session.scalar(select(User.id).where(User.id == owner_id).with_for_update())
         running = await session.scalar(
@@ -42,11 +68,16 @@ async def trigger_next(owner_id: int) -> None:
         if job is None:
             return
         job.status = JobStatus.queued
-        session.add(JobLog(job_id=job.id, message="queued job published"))
+        session.add(JobLog(job_id=job.id, message="queued job promoted for publishing"))
         await session.commit()
         await invalidate_pattern("jobs:*")
-        await publish_status(job.id, "queued")
-        await publish_job(job.id)
+        promoted_job_id = job.id
+
+    if promoted_job_id is not None:
+        await mark_queued_and_publish(
+            promoted_job_id,
+            failure_message="RabbitMQ publish failed after pending job promotion",
+        )
 
 
 async def claim_job(job_id: int) -> tuple[int, dict] | None:
@@ -109,10 +140,13 @@ async def process(job_id: int) -> None:
                         message=f"retry scheduled {job.retry_count}",
                     )
                 )
+                retry_job_id = job.id
                 await session.commit()
                 await invalidate_pattern("jobs:*")
-                await publish_status(job.id, "queued")
-                await publish_job(job.id)
+                await mark_queued_and_publish(
+                    retry_job_id,
+                    failure_message="RabbitMQ publish failed after retry scheduling",
+                )
                 return
             job.status = JobStatus.failed
             job.completed_at = datetime.now(timezone.utc)
