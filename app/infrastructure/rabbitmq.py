@@ -2,6 +2,13 @@ import json
 import aio_pika
 from app.core.config import get_settings
 
+def jobs_queue_arguments() -> dict[str, str]:
+    s = get_settings()
+    return {
+        "x-dead-letter-exchange": s.jobs_dead_letter_exchange,
+        "x-dead-letter-routing-key": s.jobs_dead_letter_routing_key,
+    }
+
 async def configure_topology(channel) -> None:
     s = get_settings()
     dlx = await channel.declare_exchange(s.jobs_dead_letter_exchange, aio_pika.ExchangeType.DIRECT, durable=True)
@@ -10,7 +17,7 @@ async def configure_topology(channel) -> None:
     await channel.declare_queue(
         s.jobs_queue_name,
         durable=True,
-        arguments={"x-dead-letter-exchange": s.jobs_dead_letter_exchange, "x-dead-letter-routing-key": s.jobs_dead_letter_routing_key},
+        arguments=jobs_queue_arguments(),
     )
 
 async def publish_job(job_id:int, correlation_id: str | None = None, outbox_event_id: int | None = None) -> None:

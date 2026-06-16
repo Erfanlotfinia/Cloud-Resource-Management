@@ -4,7 +4,7 @@ from sqlalchemy import func, select
 from app.core.config import get_settings
 from app.core.logging import configure_logging, get_logger
 from app.infrastructure.database import SessionLocal
-from app.infrastructure.rabbitmq import configure_topology, get_connection
+from app.infrastructure.rabbitmq import configure_topology, get_connection, jobs_queue_arguments
 from app.infrastructure.redis import invalidate_pattern, publish_status
 from app.models.job import Job, JobLog, JobStatus, LogLevel, OutboxEvent
 from app.models.user import User
@@ -130,7 +130,7 @@ async def recovery_loop():
 async def main() -> None:
     configure_logging(); asyncio.create_task(recovery_loop())
     connection = await get_connection(); channel = await connection.channel(); await channel.set_qos(prefetch_count=5); await configure_topology(channel)
-    queue = await channel.declare_queue(get_settings().jobs_queue_name, durable=True)
+    queue = await channel.declare_queue(get_settings().jobs_queue_name, durable=True, arguments=jobs_queue_arguments())
     async with queue.iterator() as iterator:
         async for message in iterator:
             async with message.process(requeue=False):
