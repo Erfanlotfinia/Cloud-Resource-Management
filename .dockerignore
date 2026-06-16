@@ -22,10 +22,6 @@ __pycache__
 dist
 build
 
-# Tests and dev tooling (not needed in the runtime image)
-tests
-pytest.ini
-
 # Documentation and compose (not used inside the container)
 README.md
 DESIGN.md

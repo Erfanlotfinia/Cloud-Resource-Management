@@ -34,4 +34,5 @@ async def publish_job(job_id:int, correlation_id: str | None = None, outbox_even
             ),
             routing_key=s.jobs_queue_name,
         )
-async def get_connection(): return await aio_pika.connect_robust(get_settings().rabbitmq_url)
+async def get_connection():
+    return await aio_pika.connect_robust(get_settings().rabbitmq_url)

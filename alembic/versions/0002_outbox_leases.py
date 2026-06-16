@@ -16,6 +16,7 @@ depends_on = None
 def upgrade():
     outbox_status = postgresql.ENUM('pending', 'sent', 'failed', name='outbox_status')
     outbox_status.create(op.get_bind(), checkfirst=True)
+    outbox_status_type = postgresql.ENUM('pending', 'sent', 'failed', name='outbox_status', create_type=False)
     op.add_column('jobs', sa.Column('correlation_id', sa.String(length=64), nullable=True))
     op.execute("UPDATE jobs SET correlation_id = md5(random()::text || clock_timestamp()::text) WHERE correlation_id IS NULL")
     op.alter_column('jobs', 'correlation_id', nullable=False)
@@ -29,7 +30,7 @@ def upgrade():
         sa.Column('id', sa.Integer(), primary_key=True),
         sa.Column('event_type', sa.String(length=100), nullable=False),
         sa.Column('payload', postgresql.JSONB(), nullable=False),
-        sa.Column('status', outbox_status, nullable=False, server_default='pending'),
+        sa.Column('status', outbox_status_type, nullable=False, server_default='pending'),
         sa.Column('retry_count', sa.Integer(), nullable=False, server_default='0'),
         sa.Column('next_attempt_at', sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),
         sa.Column('last_error', sa.Text(), nullable=True),

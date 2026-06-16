@@ -3,10 +3,30 @@ from sqlalchemy import DateTime, Enum, ForeignKey, Index, Integer, String, Text,
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.infrastructure.database import Base
-class JobStatus(str, enum.Enum): pending='pending'; queued='queued'; running='running'; completed='completed'; failed='failed'; cancelled='cancelled'
-class LogLevel(str, enum.Enum): info='info'; warning='warning'; error='error'
-class OutboxStatus(str, enum.Enum): pending='pending'; sent='sent'; failed='failed'
+
+
+class JobStatus(str, enum.Enum):
+    pending='pending'
+    queued='queued'
+    running='running'
+    completed='completed'
+    failed='failed'
+    cancelled='cancelled'
+    
+class LogLevel(str, enum.Enum):
+    info='info'
+    warning='warning'
+    error='error'
+    
+class OutboxStatus(str, enum.Enum):
+    pending='pending'
+    sent='sent'
+    failed='failed'
+
+    
 JSONType = JSON().with_variant(JSONB, 'postgresql')
+
+
 class Job(Base):
     __tablename__='jobs'
     id: Mapped[int]=mapped_column(Integer, primary_key=True)
@@ -26,6 +46,8 @@ class Job(Base):
     updated_at=mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
     owner=relationship('User', back_populates='jobs'); logs=relationship('JobLog', back_populates='job', cascade='all, delete-orphan')
     __table_args__=(Index('ix_jobs_owner_created','owner_id','created_at'), Index('ix_jobs_owner_status_lock','owner_id','status','lock_expires_at'), Index('uq_jobs_owner_idempotency_key','owner_id','idempotency_key', unique=True, postgresql_where=text('idempotency_key IS NOT NULL')),)
+
+
 class JobLog(Base):
     __tablename__='job_logs'
     id: Mapped[int]=mapped_column(Integer, primary_key=True)
@@ -34,6 +56,8 @@ class JobLog(Base):
     message: Mapped[str]=mapped_column(Text, nullable=False)
     created_at=mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     job=relationship('Job', back_populates='logs')
+
+
 class OutboxEvent(Base):
     __tablename__='outbox_events'
     id: Mapped[int]=mapped_column(Integer, primary_key=True)

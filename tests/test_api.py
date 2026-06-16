@@ -1,12 +1,14 @@
 import pytest
 from httpx import ASGITransport, AsyncClient
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.core.config import get_settings
 from app.infrastructure import rabbitmq, redis as redisinfra
 from app.infrastructure.database import Base, get_session
 from app.main import app
-from app.workers import runner
+from app.models.job import OutboxEvent, OutboxStatus
+from app.workers import outbox_publisher, runner
 
 
 @pytest.fixture
@@ -22,7 +24,7 @@ async def client(monkeypatch):
 
     published = []
 
-    async def fake_publish(job_id: int):
+    async def fake_publish(job_id: int, correlation_id: str | None = None, outbox_event_id: int | None = None):
         published.append(job_id)
 
     async def noop(*args, **kwargs):
@@ -41,12 +43,14 @@ async def client(monkeypatch):
         async def expire(self, key, ttl):
             return None
 
+    async def count_outbox():
+        async with Session() as session:
+            return await session.scalar(select(func.count()).select_from(OutboxEvent)) or 0
+
     get_settings.cache_clear()
     monkeypatch.setenv("ADMIN_SETUP_TOKEN", "setup-token")
     app.dependency_overrides[get_session] = override_session
     monkeypatch.setattr(rabbitmq, "publish_job", fake_publish)
-    monkeypatch.setattr("app.services.jobs.publish_job", fake_publish)
-    monkeypatch.setattr("app.workers.runner.publish_job", fake_publish)
     monkeypatch.setattr(redisinfra, "safe_get", none)
     monkeypatch.setattr(redisinfra, "safe_setex", noop)
     monkeypatch.setattr(redisinfra, "invalidate_pattern", noop)
@@ -55,7 +59,9 @@ async def client(monkeypatch):
     monkeypatch.setattr("app.workers.runner.publish_status", noop)
     monkeypatch.setattr(redisinfra, "get_redis", lambda: FakeRedis())
     monkeypatch.setattr(runner, "SessionLocal", Session)
+    monkeypatch.setattr(outbox_publisher, "SessionLocal", Session)
     app.state.published_jobs = published
+    app.state.count_outbox = count_outbox
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
         yield ac
     app.dependency_overrides.clear()
@@ -121,7 +127,7 @@ async def test_create_job_reserves_dispatch_slots_and_rate_limits(client):
         statuses.append(response.json()["status"])
     assert statuses.count("queued") == 3
     assert statuses.count("pending") == 1
-    assert len(app.state.published_jobs) == 3
+    assert await app.state.count_outbox() == 3
     for _ in range(6):
         assert (await client.post("/jobs", headers=headers, json={"payload": {}})).status_code == 201
     assert (await client.post("/jobs", headers=headers, json={"payload": {}})).status_code == 429
@@ -147,8 +153,8 @@ async def test_worker_success_and_retry_failure_paths(client):
 
 
 @pytest.mark.asyncio
-async def test_trigger_next_restores_pending_when_promotion_publish_fails(client, monkeypatch):
-    user_token = await token(client, "promotion-failure@example.com")
+async def test_trigger_next_promotes_pending_via_outbox(client):
+    user_token = await token(client, "promotion@example.com")
     headers = {"Authorization": f"Bearer {user_token}"}
     created = []
     for _ in range(4):
@@ -157,13 +163,32 @@ async def test_trigger_next_restores_pending_when_promotion_publish_fails(client
         created.append(response.json())
     pending_job = next(job for job in created if job["status"] == "pending")
 
-    async def failing_publish(job_id: int):
-        raise RuntimeError("broker down")
-
-    monkeypatch.setattr("app.workers.runner.publish_job", failing_publish)
     await runner.trigger_next(pending_job["owner_id"])
 
     details = (await client.get(f"/jobs/{pending_job['id']}", headers=headers)).json()
-    assert details["status"] == "pending"
+    assert details["status"] == "queued"
+    assert await app.state.count_outbox() == 4
     logs = (await client.get(f"/jobs/{pending_job['id']}/logs", headers=headers)).json()
-    assert any("RabbitMQ publish failed after pending job promotion" in log["message"] for log in logs)
+    assert any("queued job promoted via outbox" in log["message"] for log in logs)
+
+
+@pytest.mark.asyncio
+async def test_outbox_publish_failure_keeps_event_pending(client, monkeypatch):
+    user_token = await token(client, "outbox-failure@example.com")
+    headers = {"Authorization": f"Bearer {user_token}"}
+    response = await client.post("/jobs", headers=headers, json={"payload": {}})
+    assert response.status_code == 201
+
+    async def failing_publish(*args, **kwargs):
+        raise RuntimeError("broker down")
+
+    monkeypatch.setattr("app.infrastructure.rabbitmq.publish_job", failing_publish)
+
+    sent = await outbox_publisher.publish_pending_once()
+    assert sent == 0
+
+    async with runner.SessionLocal() as session:
+        event = await session.scalar(select(OutboxEvent))
+        assert event is not None
+        assert event.status == OutboxStatus.pending
+        assert event.retry_count == 1

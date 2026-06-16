@@ -2,7 +2,13 @@ import enum
 from sqlalchemy import Boolean, DateTime, Enum, Integer, String, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.infrastructure.database import Base
-class UserRole(str, enum.Enum): user='user'; admin='admin'
+
+
+class UserRole(str, enum.Enum):
+    user='user'
+    admin='admin'
+    
+    
 class User(Base):
     __tablename__='users'
     id: Mapped[int]=mapped_column(Integer, primary_key=True)
