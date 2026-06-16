@@ -1,0 +1,36 @@
+# Git and editor
+.git
+.gitignore
+.cursor
+.vscode
+.idea
+
+# Local environment and secrets
+.env
+.env.*
+.venv
+venv
+
+# Python artifacts
+__pycache__
+*.py[cod]
+*.pyo
+.pytest_cache
+.mypy_cache
+.ruff_cache
+*.egg-info
+dist
+build
+
+# Tests and dev tooling (not needed in the runtime image)
+tests
+pytest.ini
+
+# Documentation and compose (not used inside the container)
+README.md
+DESIGN.md
+docker-compose.yml
+
+# Docker
+Dockerfile
+.dockerignore
